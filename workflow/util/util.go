@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	apiv1 "k8s.io/api/core/v1"
 	apierr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -21,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers/internalinterfaces"
@@ -217,7 +220,12 @@ func SubmitWorkflow(wfIf v1alpha1.WorkflowInterface, wfClientset wfclientset.Int
 			}
 
 			for k, v := range yamlParams {
-				value := fmt.Sprintf("%s", v)
+				// We get quoted strings from the yaml file.
+				value, err := strconv.Unquote(string(v))
+				if err != nil {
+					// the string is already clean.
+					value = string(v)
+				}
 				param := wfv1.Parameter{
 					Name:  k,
 					Value: &value,
@@ -514,7 +522,7 @@ func RetryWorkflow(kubeClient kubernetes.Interface, wfClient v1alpha1.WorkflowIn
 			// do not add this status to the node. pretend as if this node never existed.
 		default:
 			// Do not allow retry of workflows with pods in Running/Pending phase
-			return nil, errors.InternalErrorf("Workflow cannot be retried with node %s in %s phase", node, node.Phase)
+			return nil, errors.InternalErrorf("Workflow cannot be retried with node %s in %s phase", node.Name, node.Phase)
 		}
 		if node.Type == wfv1.NodeTypePod {
 			log.Infof("Deleting pod: %s", node.ID)
@@ -668,4 +676,57 @@ func ReadManifest(manifestPaths ...string) ([][]byte, error) {
 		}
 	}
 	return manifestContents, err
+}
+
+func IsJSONStr(str string) bool {
+	str = strings.TrimSpace(str)
+	return len(str) > 0 && str[0] == '{'
+}
+
+func ConvertYAMLToJSON(str string) (string, error) {
+	if !IsJSONStr(str) {
+		jsonStr, err := yaml.YAMLToJSON([]byte(str))
+		if err != nil {
+			return str, err
+		}
+		return string(jsonStr), nil
+	}
+	return str, nil
+}
+
+// PodSpecPatchMerge will do strategic merge the workflow level PodSpecPatch and template level PodSpecPatch
+func PodSpecPatchMerge(wf *wfv1.Workflow, tmpl *wfv1.Template) (string, error) {
+	var wfPatch, tmplPatch, mergedPatch string
+	var err error
+
+	if wf.Spec.HasPodSpecPatch() {
+		wfPatch, err = ConvertYAMLToJSON(wf.Spec.PodSpecPatch)
+		if err != nil {
+			return "", err
+		}
+	}
+	if tmpl.HasPodSpecPatch() {
+		tmplPatch, err = ConvertYAMLToJSON(tmpl.PodSpecPatch)
+		if err != nil {
+			return "", err
+		}
+
+		if wfPatch != "" {
+			mergedByte, err := strategicpatch.StrategicMergePatch([]byte(wfPatch), []byte(tmplPatch), apiv1.PodSpec{})
+			if err != nil {
+				return "", err
+			}
+			mergedPatch = string(mergedByte)
+		} else {
+			mergedPatch = tmplPatch
+		}
+	} else {
+		mergedPatch = wfPatch
+	}
+	return mergedPatch, nil
+}
+
+func ValidateJsonStr(jsonStr string, schema interface{}) bool {
+	err := json.Unmarshal([]byte(jsonStr), &schema)
+	return err == nil
 }

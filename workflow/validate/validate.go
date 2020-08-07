@@ -6,6 +6,7 @@ import (
 	"io"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/valyala/fasttemplate"
@@ -121,6 +122,10 @@ func ValidateWorkflow(wfClientset wfclientset.Interface, namespace string, wf *w
 	}
 	for k := range wf.ObjectMeta.Labels {
 		ctx.globalParams["workflow.labels."+k] = placeholderValue
+	}
+
+	if wf.Spec.Priority != nil {
+		ctx.globalParams[common.GlobalVarWorkflowPriority] = strconv.Itoa(int(*wf.Spec.Priority))
 	}
 
 	if wf.Spec.Entrypoint == "" {
@@ -538,7 +543,7 @@ func (ctx *templateValidationCtx) validateSteps(scope map[string]interface{}, tm
 	stepNames := make(map[string]bool)
 	resolvedTemplates := make(map[string]*wfv1.Template)
 	for i, stepGroup := range tmpl.Steps {
-		for _, step := range stepGroup {
+		for _, step := range stepGroup.Steps {
 			if step.Name == "" {
 				return errors.Errorf(errors.CodeBadRequest, "templates.%s.steps[%d].name is required", tmpl.Name, i)
 			}
@@ -551,6 +556,7 @@ func (ctx *templateValidationCtx) validateSteps(scope map[string]interface{}, tm
 			}
 			stepNames[step.Name] = true
 			prefix := fmt.Sprintf("steps.%s", step.Name)
+			scope[fmt.Sprintf("%s.status", prefix)] = true
 			err := addItemsToScope(prefix, step.WithItems, step.WithParam, step.WithSequence, scope)
 			if err != nil {
 				return errors.Errorf(errors.CodeBadRequest, "templates.%s.steps[%d].%s %s", tmpl.Name, i, step.Name, err.Error())
@@ -573,10 +579,11 @@ func (ctx *templateValidationCtx) validateSteps(scope map[string]interface{}, tm
 			}
 			resolvedTemplates[step.Name] = resolvedTmpl
 		}
-		for i, step := range stepGroup {
+
+		for _, step := range stepGroup.Steps {
 			aggregate := len(step.WithItems) > 0 || step.WithParam != ""
 			resolvedTmpl := resolvedTemplates[step.Name]
-			ctx.addOutputsToScope(resolvedTmpl, fmt.Sprintf("steps.%s", step.Name), scope, aggregate)
+			ctx.addOutputsToScope(resolvedTmpl, fmt.Sprintf("steps.%s", step.Name), scope, aggregate, false)
 
 			// Validate the template again with actual arguments.
 			_, err = ctx.validateTemplateHolder(&step, tmplCtx, &step.Arguments, scope)
@@ -604,11 +611,12 @@ func addItemsToScope(prefix string, withItems []wfv1.Item, withParam string, wit
 	}
 	if len(withItems) > 0 {
 		for i := range withItems {
-			switch val := withItems[i].Value.(type) {
-			case string, int, int32, int64, float32, float64, bool:
+			val := withItems[i]
+			switch val.Type {
+			case wfv1.String, wfv1.Number, wfv1.Bool:
 				scope["item"] = true
-			case map[string]interface{}:
-				for itemKey := range val {
+			case wfv1.Map:
+				for itemKey := range val.MapVal {
 					scope[fmt.Sprintf("item.%s", itemKey)] = true
 				}
 			default:
@@ -629,7 +637,7 @@ func addItemsToScope(prefix string, withItems []wfv1.Item, withParam string, wit
 	return nil
 }
 
-func (ctx *templateValidationCtx) addOutputsToScope(tmpl *wfv1.Template, prefix string, scope map[string]interface{}, aggregate bool) {
+func (ctx *templateValidationCtx) addOutputsToScope(tmpl *wfv1.Template, prefix string, scope map[string]interface{}, aggregate bool, isAncestor bool) {
 	if tmpl.Daemon != nil && *tmpl.Daemon {
 		scope[fmt.Sprintf("%s.ip", prefix)] = true
 	}
@@ -659,6 +667,9 @@ func (ctx *templateValidationCtx) addOutputsToScope(tmpl *wfv1.Template, prefix 
 		default:
 			scope[fmt.Sprintf("%s.outputs.parameters", prefix)] = true
 		}
+	}
+	if isAncestor {
+		scope[fmt.Sprintf("%s.status", prefix)] = true
 	}
 }
 
@@ -878,7 +889,7 @@ func (ctx *templateValidationCtx) validateDAG(scope map[string]interface{}, tmpl
 			return errors.Errorf(errors.CodeBadRequest, "templates.%s.tasks.%s %s", tmpl.Name, task.Name, err.Error())
 		}
 		prefix := fmt.Sprintf("tasks.%s", task.Name)
-		ctx.addOutputsToScope(resolvedTmpl, prefix, scope, false)
+		ctx.addOutputsToScope(resolvedTmpl, prefix, scope, false, false)
 		resolvedTemplates[task.Name] = resolvedTmpl
 		dupDependencies := make(map[string]bool)
 		for j, depName := range task.Dependencies {
@@ -912,7 +923,7 @@ func (ctx *templateValidationCtx) validateDAG(scope map[string]interface{}, tmpl
 		resolvedTmpl := resolvedTemplates[task.Name]
 		// add all tasks outputs to scope so that a nested DAGs can have outputs
 		prefix := fmt.Sprintf("tasks.%s", task.Name)
-		ctx.addOutputsToScope(resolvedTmpl, prefix, scope, false)
+		ctx.addOutputsToScope(resolvedTmpl, prefix, scope, false, false)
 		taskBytes, err := json.Marshal(task)
 		if err != nil {
 			return errors.InternalWrapError(err)
@@ -927,7 +938,7 @@ func (ctx *templateValidationCtx) validateDAG(scope map[string]interface{}, tmpl
 			resolvedTmpl := resolvedTemplates[ancestor]
 			ancestorPrefix := fmt.Sprintf("tasks.%s", ancestor)
 			aggregate := len(ancestorTask.WithItems) > 0 || ancestorTask.WithParam != ""
-			ctx.addOutputsToScope(resolvedTmpl, ancestorPrefix, taskScope, aggregate)
+			ctx.addOutputsToScope(resolvedTmpl, ancestorPrefix, taskScope, aggregate, true)
 		}
 		err = addItemsToScope(prefix, task.WithItems, task.WithParam, task.WithSequence, taskScope)
 		if err != nil {
